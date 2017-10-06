@@ -1,4 +1,4 @@
-﻿// Copyright (c) .NET Foundation. All rights reserved.
+// Copyright (c) .NET Foundation. All rights reserved.
 // Licensed under the Apache License, Version 2.0. See License.txt in the project root for license information.
 
 using System;
@@ -20,6 +20,7 @@ namespace Microsoft.EntityFrameworkCore.ChangeTracking.Internal
     public class IdentityMap<TKey> : IIdentityMap
     {
         private readonly bool _sensitiveLoggingEnabled;
+        private readonly bool _snapshotTracking;
         private readonly Dictionary<TKey, InternalEntityEntry> _identityMap;
         private readonly IForeignKey[] _foreignKeys;
         private Dictionary<IForeignKey, IDependentsMap> _dependentMaps;
@@ -37,6 +38,7 @@ namespace Microsoft.EntityFrameworkCore.ChangeTracking.Internal
             Key = key;
             PrincipalKeyValueFactory = principalKeyValueFactory;
             _identityMap = new Dictionary<TKey, InternalEntityEntry>(principalKeyValueFactory.EqualityComparer);
+            _snapshotTracking = key.DeclaringEntityType.GetChangeTrackingStrategy() == ChangeTrackingStrategy.Snapshot;
 
             if (key.IsPrimaryKey())
             {
@@ -163,7 +165,7 @@ namespace Microsoft.EntityFrameworkCore.ChangeTracking.Internal
         ///     directly from your code. This API may change or be removed in future releases.
         /// </summary>
         public virtual void AddOrUpdate(InternalEntityEntry entry)
-            => AddInternal(PrincipalKeyValueFactory.CreateFromCurrentValues(entry), entry);
+            => Add(PrincipalKeyValueFactory.CreateFromCurrentValues(entry), entry, updateDuplicate: true);
 
         /// <summary>
         ///     This API supports the Entity Framework Core infrastructure and is not intended to be used
@@ -184,52 +186,77 @@ namespace Microsoft.EntityFrameworkCore.ChangeTracking.Internal
         ///     directly from your code. This API may change or be removed in future releases.
         /// </summary>
         protected virtual void Add([NotNull] TKey key, [NotNull] InternalEntityEntry entry)
+            => Add(key, entry, updateDuplicate: false);
+
+        private void ThrowIdentityConflict(InternalEntityEntry entry)
         {
-            if (_identityMap.TryGetValue(key, out var existingEntry))
+            if (entry.EntityType.IsOwned())
             {
-                if (existingEntry != entry)
+                if (_sensitiveLoggingEnabled)
                 {
-                    if (entry.EntityType.IsOwned())
-                    {
-                        if (_sensitiveLoggingEnabled)
-                        {
-                            throw new InvalidOperationException(
-                                CoreStrings.IdentityConflictOwnedSensitive(
-                                    entry.EntityType.DisplayName(),
-                                    entry.BuildCurrentValuesString(Key.Properties)));
-
-                        }
-
-                        throw new InvalidOperationException(
-                            CoreStrings.IdentityConflictOwned(
-                                entry.EntityType.DisplayName(),
-                                Property.Format(Key.Properties)));
-                    }
-                    else
-                    {
-                        if (_sensitiveLoggingEnabled)
-                        {
-                            throw new InvalidOperationException(
-                                CoreStrings.IdentityConflictSensitive(
-                                    entry.EntityType.DisplayName(),
-                                    entry.BuildCurrentValuesString(Key.Properties)));
-
-                        }
-                        throw new InvalidOperationException(
-                            CoreStrings.IdentityConflict(
-                                entry.EntityType.DisplayName(),
-                                Property.Format(Key.Properties)));
-                    }
+                    throw new InvalidOperationException(
+                        CoreStrings.IdentityConflictOwnedSensitive(
+                            entry.EntityType.DisplayName(),
+                            entry.BuildCurrentValuesString(Key.Properties)));
                 }
+
+                throw new InvalidOperationException(
+                    CoreStrings.IdentityConflictOwned(
+                        entry.EntityType.DisplayName(),
+                        Property.Format(Key.Properties)));
             }
-            else
+
+            if (_sensitiveLoggingEnabled)
             {
-                AddInternal(key, entry);
+                throw new InvalidOperationException(
+                    CoreStrings.IdentityConflictSensitive(
+                        entry.EntityType.DisplayName(),
+                        entry.BuildCurrentValuesString(Key.Properties)));
             }
+
+            throw new InvalidOperationException(
+                CoreStrings.IdentityConflict(
+                    entry.EntityType.DisplayName(),
+                    Property.Format(Key.Properties)));
         }
 
-        private void AddInternal(TKey key, InternalEntityEntry entry)
+        private void Add(TKey key, InternalEntityEntry entry, bool updateDuplicate)
         {
+            if (_identityMap.TryGetValue(key, out var existingEntry)
+                && !updateDuplicate)
+            {
+                if (existingEntry == entry)
+                {
+                    return;
+                }
+
+                if (!_snapshotTracking
+                    || (entry.EntityState == EntityState.Deleted) == (existingEntry.EntityState == EntityState.Deleted))
+                {
+                    ThrowIdentityConflict(entry);
+                }
+
+                if (existingEntry.SharedIdentityEntry != null)
+                {
+                    if (existingEntry.SharedIdentityEntry == entry)
+                    {
+                        return;
+                    }
+                    ThrowIdentityConflict(entry);
+                }
+            }
+
+            if (existingEntry != null
+                && (entry.EntityState == EntityState.Deleted) != (existingEntry.EntityState == EntityState.Deleted))
+            {
+                entry.SharedIdentityEntry = existingEntry;
+                existingEntry.SharedIdentityEntry = entry;
+                if (existingEntry.EntityState != EntityState.Deleted)
+                {
+                    return;
+                }
+            }
+
             _identityMap[key] = entry;
 
             if (_dependentMaps != null
@@ -239,6 +266,10 @@ namespace Microsoft.EntityFrameworkCore.ChangeTracking.Internal
                 {
                     if (_dependentMaps.TryGetValue(foreignKey, out var map))
                     {
+                        if (existingEntry != null)
+                        {
+                            map.Remove(existingEntry);
+                        }
                         map.Add(entry);
                     }
                 }
@@ -311,6 +342,19 @@ namespace Microsoft.EntityFrameworkCore.ChangeTracking.Internal
         /// </summary>
         protected virtual void Remove([NotNull] TKey key, [NotNull] InternalEntityEntry entry)
         {
+            InternalEntityEntry otherEntry = null;
+            if (entry.SharedIdentityEntry != null)
+            {
+                otherEntry = entry.SharedIdentityEntry;
+                otherEntry.SharedIdentityEntry = null;
+                entry.SharedIdentityEntry = null;
+
+                if (entry.EntityState == EntityState.Deleted)
+                {
+                    return;
+                }
+            }
+
             _identityMap.Remove(key);
 
             if (_dependentMaps != null
@@ -321,6 +365,10 @@ namespace Microsoft.EntityFrameworkCore.ChangeTracking.Internal
                     if (_dependentMaps.TryGetValue(foreignKey, out var map))
                     {
                         map.Remove(entry);
+                        if (otherEntry != null)
+                        {
+                            map.Add(otherEntry);
+                        }
                     }
                 }
             }

@@ -1,4 +1,4 @@
-﻿// Copyright (c) .NET Foundation. All rights reserved.
+// Copyright (c) .NET Foundation. All rights reserved.
 // Licensed under the Apache License, Version 2.0. See License.txt in the project root for license information.
 
 using System;
@@ -59,6 +59,12 @@ namespace Microsoft.EntityFrameworkCore.ChangeTracking.Internal
         ///     directly from your code. This API may change or be removed in future releases.
         /// </summary>
         public virtual IStateManager StateManager { [DebuggerStepThrough] get; }
+
+        /// <summary>
+        ///     This API supports the Entity Framework Core infrastructure and is not intended to be used
+        ///     directly from your code. This API may change or be removed in future releases.
+        /// </summary>
+        public virtual InternalEntityEntry SharedIdentityEntry { get; [param: CanBeNull] set; }
 
         /// <summary>
         ///     This API supports the Entity Framework Core infrastructure and is not intended to be used
@@ -256,6 +262,27 @@ namespace Microsoft.EntityFrameworkCore.ChangeTracking.Internal
             }
 
             StateManager.InternalEntityEntryNotifier.StateChanged(this, oldState, fromQuery: false);
+
+            if (SharedIdentityEntry != null)
+            {
+                if (newState == EntityState.Deleted)
+                {
+                    ResolveSharedIdentityEntry(this, SharedIdentityEntry);
+                }
+
+                ResolveSharedIdentityEntry(SharedIdentityEntry, this);
+            }
+        }
+
+        private static void ResolveSharedIdentityEntry(InternalEntityEntry deletedEntry, InternalEntityEntry newEntry)
+        {
+            foreach (var property in newEntry.EntityType.GetProperties())
+            {
+                newEntry.SetOriginalValue(property, deletedEntry.GetOriginalValue(property));
+            }
+
+            deletedEntry.SetEntityState(EntityState.Detached);
+            newEntry.SetEntityState(EntityState.Modified);
         }
 
         /// <summary>
@@ -1008,7 +1035,7 @@ namespace Microsoft.EntityFrameworkCore.ChangeTracking.Internal
 
                 foreach (var property in EntityType.GetProperties())
                 {
-                    if (storeGeneratedValues.TryGetValue(property, out var value))
+                    if (storeGeneratedValues.TryGetValue(property, out var _))
                     {
                         var isTemp = HasTemporaryValue(property);
 
